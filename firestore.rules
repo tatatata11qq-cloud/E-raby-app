@@ -1,0 +1,34 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null; }
+    function prof() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function active() { return signed() && prof().banned != true; }
+    function staff() { return active() && prof().role in ['teacher', 'admin']; }
+    function admin() { return active() && prof().role == 'admin'; }
+
+    match /users/{uid} {
+      allow read: if signed() && (request.auth.uid == uid || staff());
+      // التسجيل الذاتي طالب فقط؛ الترقية والحظر من المدير فقط
+      allow create: if signed() && request.auth.uid == uid
+        && request.resource.data.role == 'student' && request.resource.data.banned == false
+        && request.resource.data.keys().hasOnly(['fullName', 'email', 'role', 'banned', 'createdAt']);
+      allow update: if admin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'banned']);
+    }
+    match /levels/{id}   { allow read: if active(); allow write: if staff(); }
+    match /parts/{id}    { allow read: if active(); allow write: if staff(); }
+    match /contents/{id} { allow read: if active(); allow write: if staff(); }
+    match /results/{id} {
+      allow read: if active() && (resource.data.uid == request.auth.uid || staff());
+      allow create: if active() && request.resource.data.uid == request.auth.uid;
+    }
+    match /messages/{id} {
+      allow read: if active() && (staff() || resource.data.threadId == request.auth.uid);
+      allow create: if active() && request.resource.data.from == request.auth.uid
+        && request.resource.data.text is string && request.resource.data.text.size() <= 2000
+        && ((staff() && request.resource.data.fromStaff == true)
+            || (request.resource.data.threadId == request.auth.uid && request.resource.data.fromStaff == false));
+    }
+    match /config/{id} { allow read: if true; allow write: if admin(); }
+  }
+}
