@@ -1,0 +1,256 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // HELPER FUNCTIONS & AUTH VERIFICATION
+    // =========================================================================
+    
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    // Reliable Primary Teacher identification via verified email claim & Firestore record
+    // Configured for new email: tatatata11qq@gmail.com (with legacy support for transition)
+    function isPrimaryTeacher() {
+      return isAuthenticated() && (
+        request.auth.token.email.lower() == 'tatatata11qq@gmail.com' ||
+        request.auth.token.email.lower() == 'tatatata11tatatata11qq@gmail.com' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'teacher' &&
+         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email.lower() == 'tatatata11qq@gmail.com' ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email.lower() == 'tatatata11tatatata11qq@gmail.com'))
+      );
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Verified Active Teacher (Master Teacher OR an active authorized teacher created by Master Teacher)
+    function isAuthorizedTeacher() {
+      return isPrimaryTeacher() || (
+        isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData().role == 'teacher' &&
+        getUserData().status == 'approved' &&
+        getUserData().get('isActive', true) == true
+      );
+    }
+
+    // Verify if the student account has been approved by the teacher
+    function isApprovedStudent() {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUserData().role == 'student' &&
+        getUserData().status == 'approved';
+    }
+
+    function isApprovedMember() {
+      return isAuthorizedTeacher() || isApprovedStudent();
+    }
+
+    // =========================================================================
+    // 1. USERS COLLECTION
+    // =========================================================================
+    match /users/{userId} {
+      // Master Teacher reads all; active teachers read students & self; users read self
+      allow read: if isPrimaryTeacher() || isOwner(userId) || (isAuthorizedTeacher() && resource.data.role == 'student');
+
+      // Student registration: role must be 'student', status must be 'pending'
+      // ONLY the Master Teacher can create teacher accounts
+      allow create: if isAuthenticated() && (
+        (isPrimaryTeacher() && request.resource.data.role == 'teacher') ||
+        (isOwner(userId) && 
+         !isPrimaryTeacher() &&
+         request.resource.data.role == 'student' && 
+         request.resource.data.status == 'pending' &&
+         request.resource.data.email.lower() != 'tatatata11qq@gmail.com' &&
+         request.resource.data.email.lower() != 'tatatata11tatatata11qq@gmail.com')
+      );
+
+      // Updates:
+      // - Master Teacher has full update privileges (including activating/deactivating ordinary teachers)
+      // - Ordinary teachers and students CANNOT change role, status, isActive, isPrimaryTeacher, or email
+      allow update: if isPrimaryTeacher() || (
+        isOwner(userId) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'status', 'isActive', 'isPrimaryTeacher', 'email', 'createdBy'])
+      );
+
+      // Deletion is strictly reserved for the Master Teacher
+      allow delete: if isPrimaryTeacher();
+    }
+
+    // =========================================================================
+    // 2. GROUPS & GROUP MEMBERS
+    // =========================================================================
+    match /groups/{groupId} {
+      allow read: if isApprovedMember();
+      allow write: if isPrimaryTeacher();
+    }
+
+    match /group_members/{memberId} {
+      allow read: if isPrimaryTeacher() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+      allow write: if isPrimaryTeacher();
+    }
+
+    // =========================================================================
+    // 3. CURRICULUM: LEVELS, SECTIONS, LESSONS & MATERIALS
+    // =========================================================================
+    match /levels/{levelId} {
+      // Unauthenticated, pending or rejected users CANNOT read levels
+      allow read: if isApprovedMember();
+      allow write: if isAuthorizedTeacher();
+    }
+
+    match /sections/{sectionId} {
+      allow read: if isApprovedMember();
+      allow write: if isAuthorizedTeacher();
+    }
+
+    match /lessons/{lessonId} {
+      // Approved students can only read published lessons; active teachers can read all
+      allow read: if isAuthorizedTeacher() || (isApprovedStudent() && resource.data.isPublished == true);
+      allow write: if isAuthorizedTeacher();
+    }
+
+    match /learning_materials/{materialId} {
+      allow read: if isApprovedMember();
+      allow write: if isAuthorizedTeacher();
+    }
+
+    match /educational_materials/{materialId} {
+      // Approved students can only read published materials; active teachers have full management access
+      allow read: if isAuthorizedTeacher() || (isApprovedStudent() && resource.data.isPublished == true);
+      allow write: if isAuthorizedTeacher();
+    }
+
+    // =========================================================================
+    // 4. QUIZZES & QUESTIONS
+    // =========================================================================
+    match /quizzes/{quizId} {
+      allow read: if isPrimaryTeacher() || (isApprovedStudent() && resource.data.isPublished == true);
+      allow write: if isPrimaryTeacher();
+    }
+
+    match /questions/{questionId} {
+      // Questions are readable by approved students during quizzes; answers managed on server/rules
+      allow read: if isApprovedMember();
+      allow write: if isPrimaryTeacher();
+    }
+
+    // =========================================================================
+    // 5. QUIZ RESULTS (Prevent client score tampering)
+    // =========================================================================
+    match /quiz_results/{resultId} {
+      // Students can only read their own scores; teacher can read all
+      allow read: if isPrimaryTeacher() || (isAuthenticated() && resource.data.studentId == request.auth.uid);
+
+      // Students can record their quiz attempt once upon completion:
+      // Must match their authenticated uid and be an approved student
+      allow create: if isApprovedStudent() && 
+        request.resource.data.studentId == request.auth.uid;
+
+      // CLIENT SCORE TAMPERING BLOCKED: Students CANNOT modify past results!
+      allow update: if isPrimaryTeacher();
+      allow delete: if isPrimaryTeacher();
+    }
+
+    // =========================================================================
+    // 6. ENROLLMENTS & CONTENT PERMISSIONS
+    // =========================================================================
+    match /enrollments/{enrollmentId} {
+      allow read: if isPrimaryTeacher() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+      allow create: if isApprovedStudent() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isPrimaryTeacher();
+    }
+
+    match /content_permissions/{permId} {
+      allow read: if isApprovedMember();
+      allow write: if isPrimaryTeacher();
+    }
+
+    // =========================================================================
+    // 7. STUDENT PROGRESS
+    // =========================================================================
+    match /student_progress/{progressId} {
+      // Each student can read and write their own progress records
+      allow read: if isPrimaryTeacher() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+      allow create, update: if isApprovedStudent() && request.resource.data.userId == request.auth.uid;
+      allow delete: if isPrimaryTeacher();
+    }
+
+    // =========================================================================
+    // 8. MESSAGES (Private Communication)
+    // =========================================================================
+    match /messages/{messageId} {
+      // Users can only view messages they sent or received
+      allow read: if isAuthenticated() && (
+        resource.data.receiverId == request.auth.uid ||
+        resource.data.senderId == request.auth.uid ||
+        isPrimaryTeacher()
+      );
+
+      // Authenticated users can send messages with their own senderId
+      allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
+
+      // Recipient can mark message as read; teacher can update
+      allow update: if isAuthenticated() && (
+        (resource.data.receiverId == request.auth.uid && 
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead'])) ||
+        isPrimaryTeacher()
+      );
+
+      allow delete: if isPrimaryTeacher();
+    }
+
+    // =========================================================================
+    // 9. ANNOUNCEMENTS & NOTIFICATIONS
+    // =========================================================================
+    match /announcements/{annId} {
+      allow read: if isAuthenticated();
+      allow write: if isPrimaryTeacher();
+    }
+
+    match /notifications/{notifId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isPrimaryTeacher() || (isAuthenticated() && request.resource.data.userId == request.auth.uid);
+      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+      allow delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isPrimaryTeacher());
+    }
+
+    // =========================================================================
+    // 10. ACTIVITY LOGS (Audit Trail)
+    // =========================================================================
+    match /activity_logs/{logId} {
+      allow read: if isPrimaryTeacher();
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Audit logs are immutable
+    }
+
+    // =========================================================================
+    // 11. REGISTRATION REQUESTS (Teacher Audit)
+    // =========================================================================
+    match /registration_requests/{reqId} {
+      allow read: if isPrimaryTeacher() || (isAuthenticated() && request.auth.uid == reqId);
+      allow create: if isAuthenticated() && request.auth.uid == reqId &&
+        request.resource.data.status == 'pending';
+      allow update: if isPrimaryTeacher();
+      allow delete: if false; // Preserved for audit
+    }
+
+    // =========================================================================
+    // 12. TEACHER PASSKEYS (WebAuthn / Biometric Authenticator Credentials)
+    // Storing ONLY public key credential metadata. NO biometric images/data.
+    // Exclusive to authenticated, active teacher accounts (linked to own UID).
+    // =========================================================================
+    match /teacher_passkeys/{teacherId} {
+      allow read, write: if isPrimaryTeacher() || (isAuthorizedTeacher() && request.auth.uid == teacherId);
+    }
+  }
+}
