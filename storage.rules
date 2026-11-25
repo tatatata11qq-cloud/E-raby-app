@@ -1,0 +1,50 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isPrimaryTeacher() {
+      return isAuthenticated() && (
+        request.auth.token.email.lower() == 'tatatata11qq@gmail.com' ||
+        request.auth.token.email.lower() == 'tatatata11tatatata11qq@gmail.com'
+      );
+    }
+
+    function isApproved() {
+      return isAuthenticated();
+    }
+
+    // Educational media, PDF books, and recordings:
+    // Readable by approved students and the teacher.
+    // Uploadable/modifiable ONLY by the primary teacher.
+    match /learning_materials/{allPaths=**} {
+      allow read: if isApproved();
+      allow write: if isPrimaryTeacher();
+    }
+
+    match /lessons/{allPaths=**} {
+      allow read: if isApproved();
+      allow write: if isPrimaryTeacher();
+    }
+
+    // Profile photos (Avatars):
+    // Readable by authenticated users; each user can upload/modify their own avatar up to 5MB
+    match /avatars/{userId}/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == userId &&
+        request.resource.size < 5 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/.*');
+    }
+
+    // Student audio submissions (for oral grammar recitation & parsing):
+    // Student can upload their audio file under their UID, readable by teacher and owner
+    match /student_submissions/{userId}/{allPaths=**} {
+      allow read: if isPrimaryTeacher() || (isAuthenticated() && request.auth.uid == userId);
+      allow write: if isAuthenticated() && request.auth.uid == userId &&
+        request.resource.size < 20 * 1024 * 1024;
+    }
+  }
+}
